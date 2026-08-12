@@ -1,5 +1,10 @@
 # video-analyzer
 
+> **This is a modified fork** of [docusphere/video-analyzer](https://github.com/docusphere/video-analyzer)
+> by Frank Nillard, used and redistributed under its original
+> Source-Available Non-Commercial license. See [FORK-CHANGES.md](FORK-CHANGES.md)
+> for what was changed. For the original, unmodified project, go upstream.
+
 Analyze any video and produce an `.avt` (Agentic Video Transcript) file — a structured, plain-text format designed for AI agent consumption.
 
 Takes any video URL (YouTube, Vimeo, X, TikTok, 400+ sites) or local file and produces a document combining timestamped transcripts, AI-generated visual descriptions, scene tags, and extracted frame references.
