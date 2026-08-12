@@ -19,7 +19,7 @@ from datetime import datetime
 from preflight import preflight_check, check_api_keys, ENV_FILE
 from download import download_video
 from transcribe import get_transcript
-from understand import understand_video
+from understand import understand_video, get_model
 from frames import extract_frames, timestamp_to_seconds
 from avt import write_avt, align_transcript_to_segments
 
@@ -34,10 +34,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('source', help="Video URL or local file path")
     parser.add_argument('--out-dir', default='.', help="Output directory (default: current dir)")
     parser.add_argument('--max-frames', type=int, default=80, help="Max frames to extract (default: 80)")
+    parser.add_argument('--transcript', choices=['auto', 'captions', 'gemini', 'whisper'],
+                        default='auto',
+                        help="Transcript source (default: auto — native captions when the "
+                             "source has them, otherwise Gemini's in-pass transcript)")
     parser.add_argument('--no-whisper', action='store_true', help="Disable Whisper fallback")
     parser.add_argument('--whisper', choices=['groq', 'openai', 'auto'], default='auto',
                         help="Force Whisper backend")
-    parser.add_argument('--low-res', action='store_true', help="Use 256px frame width (vs 512px)")
+    parser.add_argument('--frame-width', type=int, default=1280,
+                        help="Frame width in px (default: 1280; use 512+ to keep UI text legible)")
+    parser.add_argument('--low-res', action='store_true', help="Use 256px frame width")
     parser.add_argument('--force-long', action='store_true', help="Allow videos over 90 minutes")
     parser.add_argument('--start', type=str, default=None,
                         help="Start time to focus on (SS, MM:SS, or HH:MM:SS)")
@@ -152,38 +158,27 @@ def main():
             print(f"Video file too large ({video_size / 1e9:.1f} GB). Max 2 GB.", file=sys.stderr)
             sys.exit(1)
 
-        # Step 2: Transcribe
-        transcript = _load_checkpoint(video_out_dir, 'transcript')
-        if transcript:
-            print("Step 2/5: Resuming — transcript checkpoint found", file=sys.stderr)
-        else:
-            print("Step 2/5: Extracting transcript...", file=sys.stderr)
-            transcript = get_transcript(
-                subtitle_path=dl['subtitle_path'],
-                video_path=dl['video_path'],
-                whisper_backend=args.whisper,
-                no_whisper=args.no_whisper,
-            )
-            _save_checkpoint(video_out_dir, 'transcript', transcript)
-
-        # Filter transcript to range if specified
-        if start_sec is not None or end_sec is not None:
-            transcript['segments'] = _filter_segments_to_range(
-                transcript['segments'], start_sec, end_sec
-            )
-
-        # Step 3: Gemini visual understanding
+        # Step 2: Gemini video understanding (visual + transcript in one pass)
         visual_segments = _load_checkpoint(video_out_dir, 'visual')
         if visual_segments:
-            print("Step 3/5: Resuming — Gemini checkpoint found", file=sys.stderr)
+            print("Step 2/5: Resuming — Gemini checkpoint found", file=sys.stderr)
         else:
-            print("Step 3/5: Analyzing video with Gemini...", file=sys.stderr)
+            print("Step 2/5: Analyzing video with Gemini...", file=sys.stderr)
             api_key = _load_key('GOOGLE_API_KEY', ENV_FILE)
+            usage = {}
             visual_segments = understand_video(
                 dl['video_path'], api_key,
                 start_time=args.start, end_time=args.end,
+                usage_out=usage,
             )
             _save_checkpoint(video_out_dir, 'visual', visual_segments)
+
+            # Sidecar rather than .avt metadata — the .avt format spec has a
+            # fixed field set and this is run bookkeeping, not transcript data.
+            if usage:
+                usage_path = os.path.join(video_out_dir, f"{dl['slug']}.usage.json")
+                with open(usage_path, 'w') as f:
+                    json.dump(usage, f, indent=2)
 
         # Filter visual segments to range
         if start_sec is not None or end_sec is not None:
@@ -191,9 +186,62 @@ def main():
                 visual_segments, start_sec, end_sec
             )
 
+        # Step 3: Transcript.
+        # Gemini transcribes in the same pass, so its text is already aligned to
+        # each visual segment. Only fall back to captions/Whisper if that yielded
+        # nothing (silent video, or --transcript whisper).
+        gemini_spoke = any(seg.get('audio') for seg in visual_segments)
+
+        # Native captions beat Gemini's transcript when they exist: they are
+        # verbatim and complete, cost nothing, and were already downloaded,
+        # whereas Gemini elides long stretches of speech. Gemini's value is the
+        # visual analysis, which it keeps either way.
+        has_captions = bool(dl['subtitle_path'] and os.path.exists(dl['subtitle_path']))
+        source = args.transcript
+        if source == 'auto':
+            source = 'captions' if has_captions else 'gemini'
+
+        if source == 'gemini' and gemini_spoke:
+            print("Step 3/5: Using Gemini transcript (aligned in-pass)", file=sys.stderr)
+            transcript = {'segments': [], 'source': 'gemini'}
+        else:
+            transcript = _load_checkpoint(video_out_dir, 'transcript')
+            if transcript:
+                print("Step 3/5: Resuming — transcript checkpoint found", file=sys.stderr)
+            else:
+                if source == 'gemini':
+                    print("Step 3/5: Gemini found no speech — falling back to captions/Whisper",
+                          file=sys.stderr)
+                elif source == 'captions':
+                    print("Step 3/5: Using native captions (verbatim, no extra API cost)",
+                          file=sys.stderr)
+                else:
+                    print("Step 3/5: Extracting transcript...", file=sys.stderr)
+                transcript = get_transcript(
+                    subtitle_path=dl['subtitle_path'],
+                    video_path=dl['video_path'],
+                    whisper_backend=args.whisper,
+                    no_whisper=args.no_whisper,
+                )
+                _save_checkpoint(video_out_dir, 'transcript', transcript)
+
+            if start_sec is not None or end_sec is not None:
+                transcript['segments'] = _filter_segments_to_range(
+                    transcript['segments'], start_sec, end_sec
+                )
+
+            if not transcript['segments']:
+                if gemini_spoke:
+                    print("No captions or Whisper transcript — using Gemini's instead.",
+                          file=sys.stderr)
+                    transcript = {'segments': [], 'source': 'gemini'}
+                else:
+                    print("Warning: no transcript from any source — .avt will have no AUDIO content.",
+                          file=sys.stderr)
+
         # Step 4: Extract frames
         print("Step 4/5: Extracting frames...", file=sys.stderr)
-        width = 256 if args.low_res else 512
+        width = 256 if args.low_res else args.frame_width
         frame_results = extract_frames(
             dl['video_path'], visual_segments, video_out_dir,
             max_frames=args.max_frames, width=width,
@@ -202,8 +250,12 @@ def main():
         # Step 5: Assemble .avt file
         print("Step 5/5: Assembling .avt file...", file=sys.stderr)
 
-        # Align transcript to visual segments
-        aligned = align_transcript_to_segments(transcript['segments'], visual_segments)
+        # Align transcript to visual segments. Gemini's transcript is already
+        # per-segment, so it needs no fuzzy time-overlap matching.
+        if transcript['source'] == 'gemini':
+            aligned = visual_segments
+        else:
+            aligned = align_transcript_to_segments(transcript['segments'], visual_segments)
 
         # Assign frame paths to segments
         frame_map = {}
@@ -227,7 +279,7 @@ def main():
             'duration': duration_fmt,
             'source': args.source,
             'analyzed': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'model': 'gemini-2.5-flash',
+            'model': get_model(),
             'frames_extracted': len(frame_results),
             'transcript_source': transcript['source'],
         }

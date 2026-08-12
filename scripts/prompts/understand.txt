@@ -1,7 +1,10 @@
-Analyze this video and identify all key visual moments. For each distinct visual segment, provide:
+Analyze this video and identify all key moments. For each distinct segment, provide:
 - start: timestamp when this segment begins (MM:SS format)
 - end: timestamp when this segment ends (MM:SS format)
-- visual: 1-2 sentence description of what is shown on screen. Focus on: environment/setup, screen content, people visible, text on screen, production quality indicators.
+- visual: description of what is shown on screen. Focus on: environment/setup, screen content, people visible, text on screen, production quality indicators.
+- audio: transcript of what is spoken during this segment. Transcribe as close to verbatim as you can, preserving the speaker's own wording, product names, and jargon. Do not summarize or paraphrase. Use an empty string if nobody is speaking.
 - scene: one tag from this list: intro, outro, hook, cta, sponsor, talking-head, screen-recording, demo, tutorial, slide, diagram, whiteboard, code, b-roll, montage, transition, interview, reaction, commentary, other
 
-Return ONLY the JSON array. Aim for segments of 3-30 seconds each. Capture every meaningful visual change.
+When the segment shows a design tool, IDE, browser, or any application UI, read the interface chrome and include the exact on-screen names verbatim in the visual field: the name of the open file or document, the active tab or page, the labels of any named canvas elements, and the currently selected item in any layers, outline, or navigator panel. Quote these names exactly as they appear, including capitalization, slashes, and spacing — they are used to look the elements up in the source tool later. Do not invent or normalize a name you cannot read clearly; if it is illegible, say so rather than guessing.
+
+Return ONLY the JSON array. Aim for segments of 3-30 seconds each. Capture every meaningful visual change, and start a new segment whenever the on-screen document, page, or selected element changes.

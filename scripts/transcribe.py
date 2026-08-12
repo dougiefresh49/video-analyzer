@@ -35,12 +35,45 @@ def _strip_html(text: str) -> str:
 
 
 def parse_vtt_content(content: str) -> list:
-    """Parse VTT content string into segments with deduplication."""
+    """
+    Parse VTT content string into segments with deduplication.
+
+    Deduplication is per LINE, not per cue. YouTube's rolling auto-captions
+    show each line three times — scrolling in as a cue's second line, alone in
+    a filler cue, then scrolling out as the next cue's first line. The cues are
+    all textually different, so dropping repeated cues leaves every line
+    tripled; dropping lines already emitted by the previous cue does not.
+    """
     lines = content.strip().split('\n')
     segments = []
     current_start = None
     current_end = None
     current_text = []
+    last_line = None
+
+    def flush():
+        """Emit the pending cue, minus any lines already emitted."""
+        nonlocal last_line
+        fresh = []
+        for raw in current_text:
+            text = re.sub(r'\s+', ' ', _strip_html(raw)).strip()
+            if text and text != last_line:
+                fresh.append(text)
+                last_line = text
+        if not fresh:
+            # Wholly duplicated cue — extend the previous segment instead, so
+            # its time range still covers the span the words were on screen.
+            if segments:
+                segments[-1]['end'] = format_timestamp(current_end)
+                segments[-1]['end_seconds'] = current_end
+            return
+        segments.append({
+            'start': format_timestamp(current_start),
+            'end': format_timestamp(current_end),
+            'start_seconds': current_start,
+            'end_seconds': current_end,
+            'text': ' '.join(fresh),
+        })
 
     timestamp_re = re.compile(r'(\d{1,2}:\d{2}(?::\d{2})?\.\d{3})\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?\.\d{3})')
 
@@ -56,16 +89,7 @@ def parse_vtt_content(content: str) -> list:
         match = timestamp_re.match(line)
         if match:
             if current_text:
-                text = _strip_html(' '.join(current_text)).strip()
-                text = re.sub(r'\s+', ' ', text)
-                if text:
-                    segments.append({
-                        'start': format_timestamp(current_start),
-                        'end': format_timestamp(current_end),
-                        'start_seconds': current_start,
-                        'end_seconds': current_end,
-                        'text': text,
-                    })
+                flush()
 
             current_start = _parse_vtt_timestamp(match.group(1))
             current_end = _parse_vtt_timestamp(match.group(2))
@@ -75,27 +99,9 @@ def parse_vtt_content(content: str) -> list:
 
     # Save last segment
     if current_text:
-        text = _strip_html(' '.join(current_text)).strip()
-        text = re.sub(r'\s+', ' ', text)
-        if text:
-            segments.append({
-                'start': format_timestamp(current_start),
-                'end': format_timestamp(current_end),
-                'start_seconds': current_start,
-                'end_seconds': current_end,
-                'text': text,
-            })
+        flush()
 
-    # Deduplicate adjacent identical captions (YouTube rolling captions)
-    deduped = []
-    for seg in segments:
-        if deduped and deduped[-1]['text'] == seg['text']:
-            deduped[-1]['end'] = seg['end']
-            deduped[-1]['end_seconds'] = seg['end_seconds']
-        else:
-            deduped.append(seg)
-
-    return deduped
+    return segments
 
 
 def parse_vtt(vtt_path: str) -> list:
