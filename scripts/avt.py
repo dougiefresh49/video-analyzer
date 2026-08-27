@@ -17,7 +17,9 @@ RE_SEGMENT = re.compile(
 )
 RE_VISUAL = re.compile(r'^VISUAL:\s*(.+)$')
 RE_AUDIO = re.compile(r"^AUDIO:\s*'(.*)'$")
-RE_FRAME = re.compile(r'^FRAME:\s*(.+)$')
+# A segment's first FRAME line is the frame at its start. Further FRAME lines
+# carry an "@MM:SS" suffix: frames taken inside a long segment.
+RE_FRAME = re.compile(r'^FRAME:\s*(.+?)(?:\s+@(\d{1,2}:\d{2}(?::\d{2})?))?$')
 
 INT_METADATA_FIELDS = {'frames_extracted'}
 
@@ -54,6 +56,8 @@ def write_avt(metadata: dict, segments: list, output_path: str):
 
         if seg.get('frame'):
             lines.append(f"FRAME: {seg['frame']}")
+        for extra in seg.get('extra_frames') or []:
+            lines.append(f"FRAME: {extra['path']} @{extra['timestamp']}")
 
     lines.append('')
 
@@ -133,6 +137,7 @@ def parse_avt_content(content: str) -> dict:
                 'visual': '',
                 'audio': '',
                 'frame': None,
+                'extra_frames': [],
             }
             continue
 
@@ -149,7 +154,11 @@ def parse_avt_content(content: str) -> dict:
 
             frame_match = RE_FRAME.match(line_stripped)
             if frame_match:
-                current_segment['frame'] = frame_match.group(1)
+                path, at = frame_match.group(1), frame_match.group(2)
+                if at:
+                    current_segment['extra_frames'].append({'path': path, 'timestamp': at})
+                else:
+                    current_segment['frame'] = path
                 continue
 
     # Don't forget last segment

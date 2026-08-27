@@ -100,6 +100,20 @@ bookkeeping, not transcript data.
 `--frame-width` (default 1280, was 256) so frames stay legible enough to read
 file names and UI labels. `--low-res` restores the old 256px behavior.
 
+### Extra frames inside long segments (`--frame-interval`)
+
+One frame was taken per segment, at its start. Gemini often emits a single
+segment for a multi-minute screen recording (a five-minute scroll through an
+`AGENTS.md`, a chat reply that renders 30 seconds in), so the only frame showed
+the first screen and the numbers read aloud later were never on any frame.
+Segments now also get `floor(length / interval)` evenly spaced extra frames
+(default interval 45 s; a 46 s segment gets one at its midpoint, a 281 s
+segment gets six). Start frames are capped to `--max-frames` first; extras
+fill the remaining budget. In the `.avt`, extras follow the segment's start
+frame as additional `FRAME: <path> @MM:SS` lines; the first `FRAME:` line is
+unchanged, so readers that only look at one frame per segment see what they
+saw before.
+
 ### Prompt
 
 Rewritten to request near-verbatim audio and to read on-screen UI chrome —

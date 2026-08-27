@@ -232,6 +232,7 @@ python3 scripts/analyze.py https://youtube.com/watch?v=VIDEO_ID
 | `<source>` | required | Video URL or local file path |
 | `--out-dir DIR` | `.` | Output directory |
 | `--max-frames N` | 80 | Maximum frames to extract |
+| `--frame-interval N` | 45 | One extra frame per N seconds of a long segment, evenly spaced inside it (0 = segment starts only) |
 | `--start T` | none | Focus start time (SS, MM:SS, or HH:MM:SS) |
 | `--end T` | none | Focus end time (SS, MM:SS, or HH:MM:SS) |
 | `--no-whisper` | false | Disable Whisper fallback |

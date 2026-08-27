@@ -132,3 +132,57 @@ def test_write_avt_escapes_quotes(tmp_path):
 
     result = parse_avt(output_path)
     assert result['segments'][0]['audio'] == "It's a test with single 'quotes' inside."
+
+
+def test_extra_frames_round_trip(tmp_path):
+    from avt import write_avt, parse_avt
+
+    metadata = {
+        'title': 'Extras', 'channel': 'c', 'duration': '05:00', 'source': 'x',
+        'analyzed': '2026-08-27 00:00:00', 'model': 'm', 'frames_extracted': 4,
+        'transcript_source': 'captions',
+    }
+    segments = [
+        {
+            'start': '00:00', 'end': '04:41', 'scene': 'code',
+            'visual': 'Scrolling through a long file.', 'audio': 'talk',
+            'frame': 'frames/frame-001.jpg',
+            'extra_frames': [
+                {'path': 'frames/frame-002.jpg', 'timestamp': '01:33'},
+                {'path': 'frames/frame-003.jpg', 'timestamp': '03:07'},
+            ],
+        },
+        {
+            'start': '04:41', 'end': '05:00', 'scene': 'outro',
+            'visual': 'Wave.', 'audio': 'bye',
+            'frame': 'frames/frame-004.jpg',
+        },
+    ]
+    output_path = str(tmp_path / 'extras.avt')
+    write_avt(metadata, segments, output_path)
+
+    with open(output_path) as f:
+        text = f.read()
+    assert 'FRAME: frames/frame-001.jpg\nFRAME: frames/frame-002.jpg @01:33\nFRAME: frames/frame-003.jpg @03:07\n' in text
+
+    result = parse_avt(output_path)
+    assert result['segments'][0]['frame'] == 'frames/frame-001.jpg'
+    assert result['segments'][0]['extra_frames'] == [
+        {'path': 'frames/frame-002.jpg', 'timestamp': '01:33'},
+        {'path': 'frames/frame-003.jpg', 'timestamp': '03:07'},
+    ]
+    assert result['segments'][1]['frame'] == 'frames/frame-004.jpg'
+    assert result['segments'][1]['extra_frames'] == []
+
+
+def test_parse_extra_frame_without_start_frame():
+    from avt import parse_avt_content
+    content = (
+        "AGENTIC-VT 1.0\n\n[metadata]\ntitle: t\n\n---\n\n"
+        "[00:00 - 01:40] [scene:code]\nVISUAL: v\nAUDIO: 'a'\n"
+        "FRAME: frames/frame-001.jpg @00:50\n"
+    )
+    result = parse_avt_content(content)
+    seg = result['segments'][0]
+    assert seg['frame'] is None
+    assert seg['extra_frames'] == [{'path': 'frames/frame-001.jpg', 'timestamp': '00:50'}]
