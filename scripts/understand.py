@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Gemini video understanding — uploads video and gets structured visual analysis."""
 
+import csv
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 VALID_SCENE_TAGS = [
     'intro', 'outro', 'hook', 'cta', 'sponsor',
@@ -45,6 +50,19 @@ VALID_MEDIA_RESOLUTIONS = ("low", "medium", "high")
 # forever with no output — POLL_TIMEOUT above only guards the upload poll.
 # A 13-minute clip analyzes in ~2 min, so 15 min is generous but still bounded.
 DEFAULT_REQUEST_TIMEOUT = 900  # seconds
+
+# One generate_content call covers a whole file, so cost and latency scale with
+# duration, and long videos time out or hang (a 38-minute video at high media
+# resolution is ~670k input tokens in one request). Videos longer than this are
+# split into keyframe-aligned chunks, analyzed separately, and re-stitched on
+# the full-video timeline. 13 minutes analyzes in ~2 min.
+DEFAULT_CHUNK_SECONDS = 780
+MAX_PARALLEL_CHUNKS = 3
+
+# Gemini returns the odd 503/429 mid-run. A chunk that hits one is retried
+# (re-uploaded) rather than failing the whole video.
+TRANSIENT_ATTEMPTS = 3
+TRANSIENT_STATUS_CODES = (429, 500, 502, 503, 504)
 
 
 def get_media_resolution() -> str:
@@ -87,18 +105,27 @@ def get_model() -> str:
     return _config_value('GEMINI_MODEL') or DEFAULT_MODEL
 
 
-def get_request_timeout() -> int:
-    """Request timeout in seconds. Override with GEMINI_TIMEOUT."""
-    value = _config_value('GEMINI_TIMEOUT')
+def _positive_int_setting(name: str, default: int) -> int:
+    value = _config_value(name)
     if not value:
-        return DEFAULT_REQUEST_TIMEOUT
+        return default
     try:
         seconds = int(value)
     except ValueError:
-        raise ValueError(f"Invalid GEMINI_TIMEOUT: {value!r} (expected seconds)")
+        raise ValueError(f"Invalid {name}: {value!r} (expected seconds)")
     if seconds <= 0:
-        raise ValueError(f"Invalid GEMINI_TIMEOUT: {seconds} (must be positive)")
+        raise ValueError(f"Invalid {name}: {seconds} (must be positive)")
     return seconds
+
+
+def get_request_timeout() -> int:
+    """Request timeout in seconds. Override with GEMINI_TIMEOUT."""
+    return _positive_int_setting('GEMINI_TIMEOUT', DEFAULT_REQUEST_TIMEOUT)
+
+
+def get_chunk_seconds() -> int:
+    """Longest video (seconds) sent in one request. Override with GEMINI_CHUNK_SECONDS."""
+    return _positive_int_setting('GEMINI_CHUNK_SECONDS', DEFAULT_CHUNK_SECONDS)
 
 
 def _video_seconds(video_path: str) -> float | None:
@@ -108,6 +135,117 @@ def _video_seconds(video_path: str) -> float | None:
         return _get_duration(video_path) or None
     except Exception:
         return None
+
+
+def timestamp_to_seconds(ts: str) -> float:
+    """Parse SS, MM:SS, or H:MM:SS. Unparseable input counts as 0."""
+    parts = str(ts).strip().split(':')
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
+    except ValueError:
+        return 0.0
+
+
+def seconds_to_timestamp(seconds: float) -> str:
+    """MM:SS under an hour, H:MM:SS from an hour on — the forms frames.py parses."""
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def offset_segments(segments: list, offset_seconds: float) -> list:
+    """Shift chunk-relative start/end timestamps onto the full-video timeline."""
+    for seg in segments:
+        seg['start'] = seconds_to_timestamp(timestamp_to_seconds(seg['start']) + offset_seconds)
+        seg['end'] = seconds_to_timestamp(timestamp_to_seconds(seg['end']) + offset_seconds)
+    return segments
+
+
+def split_video(video_path: str, chunk_seconds: int, work_dir: str) -> list:
+    """
+    Split a video into chunks of roughly chunk_seconds each.
+
+    Stream copy, cut at the first keyframe after each boundary, so chunks run a
+    little long and the last one is short. Returns, in order:
+        [{'path': str, 'offset': float, 'duration': float}, ...]
+    where offset is the chunk's start on the full-video timeline.
+    """
+    ext = os.path.splitext(video_path)[1] or '.mp4'
+    list_path = os.path.join(work_dir, 'chunks.csv')
+    cmd = [
+        'ffmpeg', '-v', 'error', '-y',
+        '-i', video_path,
+        '-map', '0', '-c', 'copy',
+        '-f', 'segment',
+        '-segment_time', str(chunk_seconds),
+        '-reset_timestamps', '1',
+        '-segment_list', list_path,
+        '-segment_list_type', 'csv',
+        os.path.join(work_dir, f'chunk-%03d{ext}'),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to split video: {result.stderr.strip()}")
+
+    chunks = []
+    with open(list_path, newline='') as f:
+        for row in csv.reader(f):
+            if len(row) < 3:
+                continue
+            name, start, end = row[0], float(row[1]), float(row[2])
+            chunks.append({
+                'path': os.path.join(work_dir, name),
+                'offset': start,
+                'duration': end - start,
+            })
+    if not chunks:
+        raise RuntimeError("ffmpeg produced no chunks")
+    return chunks
+
+
+def _chunk_overlaps(chunk: dict, start_sec: float | None, end_sec: float | None) -> bool:
+    chunk_start = chunk['offset']
+    chunk_end = chunk['offset'] + chunk['duration']
+    if start_sec is not None and chunk_end < start_sec:
+        return False
+    if end_sec is not None and chunk_start > end_sec:
+        return False
+    return True
+
+
+def _is_transient(error: Exception) -> bool:
+    """True for rate limits and server-side failures worth retrying."""
+    code = getattr(error, 'code', None)
+    if code is None:
+        code = getattr(error, 'status_code', None)
+    if isinstance(code, int):
+        return code in TRANSIENT_STATUS_CODES
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        'unavailable', 'overloaded', 'resource exhausted', 'deadline exceeded',
+        'connection reset', 'temporarily', '503', '502', '504', '429',
+    ))
+
+
+def _with_transient_retry(fn, tag: str = '', attempts: int = TRANSIENT_ATTEMPTS):
+    """Call fn(); on a transient error wait and try again, up to `attempts` total."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt >= attempts or not _is_transient(e):
+                raise
+            delay = 5 * attempt
+            print(f"{tag}Transient Gemini error ({type(e).__name__}: {str(e)[:100]}); "
+                  f"retrying in {delay}s ({attempt}/{attempts - 1})...", file=sys.stderr)
+            time.sleep(delay)
 
 
 def get_prompt() -> str:
@@ -170,32 +308,45 @@ def extract_usage(response, model: str, resolution: str, video_seconds: float = 
     return usage
 
 
-def understand_video(video_path: str, api_key: str,
-                     start_time: str = None, end_time: str = None,
-                     usage_out: dict = None) -> list:
-    """
-    Upload video to Gemini and get structured visual analysis.
+_USAGE_COUNTERS = ('prompt_tokens', 'candidates_tokens', 'thoughts_tokens',
+                   'cached_tokens', 'total_tokens')
 
-    Args:
-        video_path: Path to video file
-        api_key: Gemini API key
-        start_time: Optional start time to focus on (MM:SS or HH:MM:SS)
-        end_time: Optional end time to focus on (MM:SS or HH:MM:SS)
-        usage_out: Optional dict, populated in place with token usage
 
-    Returns: list of segment dicts [{start, end, visual, audio, scene}, ...]
+def merge_usage(usages: list, model: str, resolution: str, video_seconds: float = None) -> dict:
+    """Sum per-chunk usage dicts into one figure for the whole video."""
+    available = [u for u in usages if u and u.get('available')]
+    merged = {
+        'model': model,
+        'media_resolution': resolution,
+        'available': bool(available),
+        'chunks': len(usages),
+    }
+    if not available:
+        return merged
+    for key in _USAGE_COUNTERS:
+        merged[key] = sum(u.get(key, 0) for u in available)
+    if video_seconds:
+        merged['video_seconds'] = round(video_seconds, 2)
+        merged['tokens_per_video_second'] = round(merged['prompt_tokens'] / video_seconds, 1)
+    return merged
+
+
+def _analyze_file(client, video_path: str, prompt: str, model: str, resolution: str,
+                  timeout: int, label: str = '') -> tuple:
     """
-    from google import genai
+    Upload one video file to Gemini, analyze it, and delete the upload.
+
+    Returns (segments, usage). Timestamps in segments are relative to the file.
+    """
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    tag = f"[{label}] " if label else ''
 
-    # Upload video file
     file_size = os.path.getsize(video_path)
-    print(f"Uploading video ({file_size / 1e6:.1f} MB) to Gemini...", file=sys.stderr)
+    print(f"{tag}Uploading video ({file_size / 1e6:.1f} MB) to Gemini...", file=sys.stderr)
 
     uploaded_file = client.files.upload(file=video_path)
-    print(f"Upload complete. Processing...", file=sys.stderr)
+    print(f"{tag}Upload complete. Processing...", file=sys.stderr)
 
     try:
         # Poll until ACTIVE
@@ -204,24 +355,14 @@ def understand_video(video_path: str, api_key: str,
             time.sleep(POLL_INTERVAL)
             elapsed += POLL_INTERVAL
             if elapsed >= POLL_TIMEOUT:
-                raise TimeoutError(f"Gemini file processing timed out after {POLL_TIMEOUT}s")
-            uploaded_file = client.files.get(name=uploaded_file.name)
+                raise TimeoutError(f"{tag}Gemini file processing timed out after {POLL_TIMEOUT}s")
+            uploaded_file = _with_transient_retry(
+                lambda: client.files.get(name=uploaded_file.name), tag)
 
         if uploaded_file.state.name != "ACTIVE":
-            raise RuntimeError(f"Gemini file in unexpected state: {uploaded_file.state.name}")
+            raise RuntimeError(f"{tag}Gemini file in unexpected state: {uploaded_file.state.name}")
 
-        print("Video ready. Analyzing...", file=sys.stderr)
-
-        # Generate content with structured output
-        prompt = get_prompt()
-        if start_time or end_time:
-            range_str = f" Focus ONLY on the section from {start_time or '0:00'} to {end_time or 'the end'}. Ignore content outside this range."
-            prompt += range_str
-
-        model = get_model()
-        resolution = get_media_resolution()
-        timeout = get_request_timeout()
-        print(f"Analyzing with {model} (media resolution: {resolution}, "
+        print(f"{tag}Video ready. Analyzing with {model} (media resolution: {resolution}, "
               f"timeout: {timeout}s)...", file=sys.stderr)
         try:
             response = client.models.generate_content(
@@ -235,14 +376,13 @@ def understand_video(video_path: str, api_key: str,
                 ),
             )
         except Exception as e:
-            # Long videos are the usual cause: one call covers the whole file,
-            # so cost and latency scale with duration (~290 tokens/second at
-            # high media resolution).
+            # Cost and latency scale with the file's duration (~290 tokens/second
+            # at high media resolution).
             if 'timeout' in str(e).lower() or 'timed out' in str(e).lower():
                 raise TimeoutError(
-                    f"Gemini did not respond within {timeout}s. Either raise "
-                    f"GEMINI_TIMEOUT, lower GEMINI_MEDIA_RESOLUTION, or split "
-                    f"the video into shorter parts."
+                    f"{tag}Gemini did not respond within {timeout}s. Either raise "
+                    f"GEMINI_TIMEOUT, lower GEMINI_MEDIA_RESOLUTION, or lower "
+                    f"GEMINI_CHUNK_SECONDS to send shorter pieces."
                 ) from e
             raise
 
@@ -250,23 +390,107 @@ def understand_video(video_path: str, api_key: str,
         if usage.get('available'):
             per_sec = usage.get('tokens_per_video_second')
             print(
-                f"Tokens: {usage['prompt_tokens']:,} in / {usage['candidates_tokens']:,} out"
+                f"{tag}Tokens: {usage['prompt_tokens']:,} in / {usage['candidates_tokens']:,} out"
                 + (f" ({per_sec}/video-second)" if per_sec else ""),
                 file=sys.stderr,
             )
         else:
-            print("Token usage unavailable on this response", file=sys.stderr)
-        if usage_out is not None:
-            usage_out.update(usage)
+            print(f"{tag}Token usage unavailable on this response", file=sys.stderr)
 
         segments = parse_gemini_response(response.text)
-        print(f"Gemini identified {len(segments)} visual segments", file=sys.stderr)
-        return segments
+        print(f"{tag}Gemini identified {len(segments)} visual segments", file=sys.stderr)
+        return segments, usage
 
     finally:
         # Always delete uploaded file
         try:
             client.files.delete(name=uploaded_file.name)
-            print("Cleaned up Gemini uploaded file", file=sys.stderr)
+            print(f"{tag}Cleaned up Gemini uploaded file", file=sys.stderr)
         except Exception as e:
-            print(f"Warning: failed to delete Gemini file: {e}", file=sys.stderr)
+            print(f"{tag}Warning: failed to delete Gemini file: {e}", file=sys.stderr)
+
+
+def understand_video(video_path: str, api_key: str,
+                     start_time: str = None, end_time: str = None,
+                     usage_out: dict = None) -> list:
+    """
+    Upload video to Gemini and get structured visual analysis.
+
+    Videos longer than GEMINI_CHUNK_SECONDS are split into chunks that are
+    analyzed separately (up to MAX_PARALLEL_CHUNKS at a time); the returned
+    timestamps are always on the full-video timeline.
+
+    Args:
+        video_path: Path to video file
+        api_key: Gemini API key
+        start_time: Optional start time to focus on (MM:SS or HH:MM:SS)
+        end_time: Optional end time to focus on (MM:SS or HH:MM:SS)
+        usage_out: Optional dict, populated in place with token usage
+
+    Returns: list of segment dicts [{start, end, visual, audio, scene}, ...]
+    """
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    model = get_model()
+    resolution = get_media_resolution()
+    timeout = get_request_timeout()
+    chunk_seconds = get_chunk_seconds()
+    prompt = get_prompt()
+    duration = _video_seconds(video_path) or 0
+
+    if duration <= chunk_seconds:
+        if start_time or end_time:
+            prompt += (f" Focus ONLY on the section from {start_time or '0:00'} to "
+                       f"{end_time or 'the end'}. Ignore content outside this range.")
+        segments, usage = _with_transient_retry(
+            lambda: _analyze_file(client, video_path, prompt, model, resolution, timeout))
+        if usage_out is not None:
+            usage_out.update(usage)
+        return segments
+
+    work_dir = tempfile.mkdtemp(prefix='video-analyzer-chunks-')
+    try:
+        chunks = split_video(video_path, chunk_seconds, work_dir)
+        start_sec = timestamp_to_seconds(start_time) if start_time else None
+        end_sec = timestamp_to_seconds(end_time) if end_time else None
+        selected = [c for c in chunks if _chunk_overlaps(c, start_sec, end_sec)]
+        skipped = len(chunks) - len(selected)
+        print(
+            f"Video is {seconds_to_timestamp(duration)} — analyzing as {len(selected)} "
+            f"chunk(s) of ~{chunk_seconds // 60} min"
+            + (f" ({skipped} outside the requested range skipped)" if skipped else ""),
+            file=sys.stderr,
+        )
+
+        results = [None] * len(selected)
+        usages = [None] * len(selected)
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CHUNKS, len(selected))) as pool:
+            def _run(chunk, label):
+                return _with_transient_retry(
+                    lambda: _analyze_file(client, chunk['path'], prompt, model, resolution,
+                                          timeout, label),
+                    f"[{label}] ")
+
+            futures = {
+                pool.submit(_run, chunk, f"chunk {i + 1}/{len(selected)}"): i
+                for i, chunk in enumerate(selected)
+            }
+            try:
+                for future in as_completed(futures):
+                    i = futures[future]
+                    segments, usage = future.result()
+                    results[i] = offset_segments(segments, selected[i]['offset'])
+                    usages[i] = usage
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+        all_segments = [seg for segs in results for seg in segs]
+        print(f"Gemini identified {len(all_segments)} visual segments across "
+              f"{len(selected)} chunks", file=sys.stderr)
+        if usage_out is not None:
+            usage_out.update(merge_usage(usages, model, resolution, duration))
+        return all_segments
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)

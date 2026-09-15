@@ -7,6 +7,18 @@ import re
 import subprocess
 import sys
 
+BEST_FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+FALLBACK_FORMAT = (
+    'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/'
+    'bestvideo[height<=720]+bestaudio/'
+    'best[height<=720]/best'
+)
+PROGRESSIVE_FORMAT = 'best[height<=720][ext=mp4]/best[ext=mp4]/18/best'
+# Last resort: the Android innertube client is not PO-token gated (as of
+# yt-dlp 2026.07) and serves muxed streams that the web client refuses.
+ANDROID_FORMAT = 'best[height<=720][ext=mp4]/best[height<=720]/best'
+ANDROID_EXTRACTOR_ARGS = 'youtube:player_client=android'
+
 
 def is_url(source: str) -> bool:
     """Check if source is a URL (vs local file path)."""
@@ -82,18 +94,43 @@ def download_video(source: str, cache_dir: str) -> dict:
 
     # Download video + subtitles
     output_template = os.path.join(cache_dir, f"{slug}.%(ext)s")
-    dl_cmd = [
-        'yt-dlp',
-        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        '--write-subs', '--write-auto-subs',
-        '--sub-langs', 'en.*,en',
-        '--sub-format', 'vtt',
-        '--no-playlist',
-        '-o', output_template,
-        source,
-    ]
+
+    def _dl_cmd(fmt: str, extractor_args: str | None = None) -> list:
+        cmd = [
+            'yt-dlp',
+            '-f', fmt,
+            '--write-subs', '--write-auto-subs',
+            '--sub-langs', 'en.*,en',
+            '--sub-format', 'vtt',
+            '--no-playlist',
+            '-o', output_template,
+        ]
+        if extractor_args:
+            cmd += ['--extractor-args', extractor_args]
+        cmd.append(source)
+        return cmd
+
     print(f"Downloading: {title}...", file=sys.stderr)
-    dl_result = subprocess.run(dl_cmd, capture_output=True, text=True)
+    dl_result = subprocess.run(_dl_cmd(BEST_FORMAT), capture_output=True, text=True)
+
+    # YouTube gates adaptive (DASH) formats behind a PO token; without one they
+    # 403. Format selectors with `/` only fall through on selection failure, not
+    # download failure — so a selected DASH pair that 403s never reaches the
+    # progressive alternative. Retry first with a 720p DASH cap, then with a
+    # progressive-only selector (format 18 / best muxed) that still serves.
+    if dl_result.returncode != 0 and '403' in dl_result.stderr:
+        print("Best format was refused (HTTP 403). Retrying at 720p...", file=sys.stderr)
+        dl_result = subprocess.run(_dl_cmd(FALLBACK_FORMAT), capture_output=True, text=True)
+
+    if dl_result.returncode != 0 and '403' in dl_result.stderr:
+        print("Adaptive 720p also refused (HTTP 403). Retrying progressive...", file=sys.stderr)
+        dl_result = subprocess.run(_dl_cmd(PROGRESSIVE_FORMAT), capture_output=True, text=True)
+
+    if dl_result.returncode != 0 and '403' in dl_result.stderr:
+        print("Progressive also refused (HTTP 403). Retrying with Android client...", file=sys.stderr)
+        dl_result = subprocess.run(
+            _dl_cmd(ANDROID_FORMAT, ANDROID_EXTRACTOR_ARGS), capture_output=True, text=True
+        )
 
     if dl_result.returncode != 0:
         raise RuntimeError(f"yt-dlp download failed: {dl_result.stderr.strip()}")
@@ -101,8 +138,12 @@ def download_video(source: str, cache_dir: str) -> dict:
     # Find downloaded files
     video_path = None
     subtitle_path = None
+    # Refused attempts above can leave partial downloads (*.part, *.ytdl)
+    # behind; never treat those as the video.
     for f in os.listdir(cache_dir):
         full = os.path.join(cache_dir, f)
+        if f.endswith(('.part', '.ytdl')):
+            continue
         if f.endswith('.vtt') and subtitle_path is None:
             subtitle_path = full
         elif not f.endswith('.vtt') and not f.endswith('.json'):

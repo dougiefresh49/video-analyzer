@@ -20,7 +20,7 @@ from preflight import preflight_check, check_api_keys, ENV_FILE
 from download import download_video
 from transcribe import get_transcript
 from understand import understand_video, get_model
-from frames import extract_frames, timestamp_to_seconds
+from frames import DEFAULT_FRAME_INTERVAL, attach_frames, extract_frames
 from avt import write_avt, align_transcript_to_segments
 
 CACHE_BASE = os.path.expanduser("~/.cache/video-analyzer")
@@ -44,6 +44,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument('--frame-width', type=int, default=1280,
                         help="Frame width in px (default: 1280; use 512+ to keep UI text legible)")
     parser.add_argument('--low-res', action='store_true', help="Use 256px frame width")
+    parser.add_argument('--frame-interval', type=int, default=DEFAULT_FRAME_INTERVAL,
+                        help="Add one extra frame per N seconds of a long segment, evenly "
+                             f"spaced inside it (default: {DEFAULT_FRAME_INTERVAL}; "
+                             "0 = only a frame at each segment start)")
     parser.add_argument('--force-long', action='store_true', help="Allow videos over 90 minutes")
     parser.add_argument('--start', type=str, default=None,
                         help="Start time to focus on (SS, MM:SS, or HH:MM:SS)")
@@ -245,6 +249,7 @@ def main():
         frame_results = extract_frames(
             dl['video_path'], visual_segments, video_out_dir,
             max_frames=args.max_frames, width=width,
+            frame_interval=args.frame_interval,
         )
 
         # Step 5: Assemble .avt file
@@ -257,14 +262,8 @@ def main():
         else:
             aligned = align_transcript_to_segments(transcript['segments'], visual_segments)
 
-        # Assign frame paths to segments
-        frame_map = {}
-        for fr in frame_results:
-            frame_map[fr['seconds']] = fr['path']
-
-        for seg in aligned:
-            seg_seconds = timestamp_to_seconds(seg['start'])
-            seg['frame'] = frame_map.get(seg_seconds)
+        # Assign frame paths to segments (start frame + any extras inside it)
+        attach_frames(aligned, frame_results)
 
         # Build metadata
         duration_s = dl['duration']

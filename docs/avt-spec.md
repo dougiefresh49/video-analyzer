@@ -73,7 +73,7 @@ other
 
 **AUDIO line:** Single-line only. Transcript text wrapped in single quotes. Empty string `''` if no speech. Internal single quotes are escaped as `\'`. Must not contain newlines.
 
-**FRAME line:** Relative path from the .avt file to the extracted JPEG frame. Optional — segments without a key visual moment may omit the FRAME line.
+**FRAME line:** Relative path from the .avt file to the extracted JPEG frame. Optional — segments without a key visual moment may omit the FRAME line. A segment may have more than one FRAME line: the first (no suffix) is taken at the segment start; any further lines carry an ` @MM:SS` (or ` @HH:MM:SS`) suffix giving the timestamp of a frame taken inside the segment, e.g. `FRAME: frames/frame-042.jpg @17:57`. Readers that expect one frame per segment should use the first FRAME line.
 
 ### Segment rules
 

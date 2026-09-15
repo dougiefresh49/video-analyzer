@@ -70,6 +70,7 @@ Use `timeout: 600000` on the Bash tool call.
 
 Optional flags:
 - `--max-frames N` — Cap on extracted frames (default: 80)
+- `--frame-interval N` — One extra frame per N seconds of a long segment, evenly spaced inside it (default: 45; 0 = a frame at each segment start only)
 - `--start T` — Focus start time (SS, MM:SS, or HH:MM:SS). Zooms into a section.
 - `--end T` — Focus end time (SS, MM:SS, or HH:MM:SS). Use with --start for a range.
 - `--low-res` — Use 256px frame width instead of 512px (smaller output)
@@ -125,7 +126,7 @@ Each segment contains:
 - **Scene tag** — content type (intro, talking-head, screen-recording, demo, tutorial, slide, b-roll, etc.)
 - **VISUAL** — AI-generated description of what's on screen
 - **AUDIO** — Transcript text for this time range (single quotes, escaped internal quotes)
-- **FRAME** — Relative path to extracted JPEG (optional — not every segment has a frame)
+- **FRAME** — Relative path to extracted JPEG (optional — not every segment has a frame). A segment's first `FRAME:` line is taken at its start; long segments may have further `FRAME: <path> @MM:SS` lines for frames taken inside the segment — check those when the start frame doesn't show what the AUDIO is describing.
 
 ## Failure modes and handling
 

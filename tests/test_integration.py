@@ -38,9 +38,9 @@ def test_full_pipeline_local_file(tmp_path, monkeypatch):
 
     # Mock frame extraction (no actual ffmpeg)
     mock_frames = [
-        {'path': 'frames/frame-001.jpg', 'timestamp': '00:00', 'seconds': 0.0},
-        {'path': 'frames/frame-002.jpg', 'timestamp': '00:04', 'seconds': 4.0},
-        {'path': 'frames/frame-003.jpg', 'timestamp': '00:15', 'seconds': 15.0},
+        {'path': 'frames/frame-001.jpg', 'timestamp': '00:00', 'seconds': 0.0, 'segment': 0, 'kind': 'start'},
+        {'path': 'frames/frame-002.jpg', 'timestamp': '00:04', 'seconds': 4.0, 'segment': 1, 'kind': 'start'},
+        {'path': 'frames/frame-003.jpg', 'timestamp': '00:15', 'seconds': 15.0, 'segment': 2, 'kind': 'start'},
     ]
 
     out_dir = tmp_path / "output"

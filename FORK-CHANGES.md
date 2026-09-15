@@ -35,6 +35,28 @@ with no output and no error — observed once for over two hours on a 51-minute
 video. Now defaults to 900s and raises an actionable `TimeoutError` suggesting
 a longer timeout, a lower media resolution, or splitting the video.
 
+### Long videos are analyzed in chunks (`GEMINI_CHUNK_SECONDS`)
+
+A single `generate_content` call covered the whole file, so a 38-minute video
+at `high` media resolution was one ~670k-token request that hit the timeout.
+Videos longer than `GEMINI_CHUNK_SECONDS` (default 780, i.e. 13 minutes) are
+now split with ffmpeg into keyframe-aligned chunks (stream copy, no re-encode),
+analyzed up to three at a time, and stitched back together with every
+timestamp shifted onto the full-video timeline. The output is still one `.avt`
+file with global timestamps; captions, frames, and the usage sidecar are
+unaffected apart from a `chunks` count in the latter. `--start/--end` skip
+chunks entirely outside the range.
+
+### YouTube 403 fallbacks
+
+YouTube gates its adaptive (DASH) formats behind a PO token and refuses them
+with HTTP 403 to a stock `yt-dlp`. A format selector with `/` alternatives only
+falls through on *selection* failure, not on a download 403, so the pipeline
+died at step 1. The download now retries in order: 720p DASH, progressive
+(muxed) formats, then the Android innertube client (not PO-token gated as of
+yt-dlp 2026.07, 720p, same caption tracks). Partial `.part`/`.ytdl` files left
+by refused attempts are never mistaken for the video.
+
 ### Per-line VTT deduplication
 
 **Bug fix.** YouTube's rolling auto-captions show each line three times: it
@@ -77,6 +99,20 @@ bookkeeping, not transcript data.
 
 `--frame-width` (default 1280, was 256) so frames stay legible enough to read
 file names and UI labels. `--low-res` restores the old 256px behavior.
+
+### Extra frames inside long segments (`--frame-interval`)
+
+One frame was taken per segment, at its start. Gemini often emits a single
+segment for a multi-minute screen recording (a five-minute scroll through an
+`AGENTS.md`, a chat reply that renders 30 seconds in), so the only frame showed
+the first screen and the numbers read aloud later were never on any frame.
+Segments now also get `floor(length / interval)` evenly spaced extra frames
+(default interval 45 s; a 46 s segment gets one at its midpoint, a 281 s
+segment gets six). Start frames are capped to `--max-frames` first; extras
+fill the remaining budget. In the `.avt`, extras follow the segment's start
+frame as additional `FRAME: <path> @MM:SS` lines; the first `FRAME:` line is
+unchanged, so readers that only look at one frame per segment see what they
+saw before.
 
 ### Prompt
 
